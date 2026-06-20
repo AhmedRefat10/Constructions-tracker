@@ -135,22 +135,29 @@ function sortCashWithdrawals(items) {
 function getCashStatus(entries, cashWithdrawals) {
   return SOURCE_IDS.reduce((acc, source) => {
     const withdrawals = sortCashWithdrawals((cashWithdrawals || []).filter(w => w.source === source));
-    const last = withdrawals[0] || null;
-    const spent = last
+    const latest = withdrawals[0] || null;
+    const startDate = withdrawals.reduce((earliest, w) => {
+      if (!w.date) return earliest;
+      return !earliest || w.date < earliest ? w.date : earliest;
+    }, null);
+    const totalWithdrawn = withdrawals.reduce((sum, w) => sum + cleanAmount(w.amount), 0);
+    const spent = startDate
       ? CATEGORIES.reduce((sum, { id }) => (
           sum + (entries[id] || []).reduce((entrySum, e) => {
             if (e.source !== source) return entrySum;
-            if ((e.date || "") < last.date) return entrySum;
+            if ((e.date || "") < startDate) return entrySum;
             return entrySum + cleanAmount(e.amount);
           }, 0)
         ), 0)
       : 0;
 
     acc[source] = {
-      last,
+      latest,
       withdrawals,
+      startDate,
+      totalWithdrawn,
       spent,
-      remaining: last ? cleanAmount(last.amount) - spent : 0,
+      remaining: totalWithdrawn - spent,
     };
     return acc;
   }, {});
@@ -609,9 +616,9 @@ export default function App() {
       {view === "cash" && (
         <div style={{ padding: 16 }}>
           <div style={{ background: "#0F1A0F", borderRadius: 14, padding: 18, marginBottom: 16, border: "1px solid #2A5A2A" }}>
-            <div style={{ fontSize: 13, color: "#5BEF8D", fontWeight: 700, marginBottom: 12 }}>💵 كاش المدة الحالية</div>
+            <div style={{ fontSize: 13, color: "#5BEF8D", fontWeight: 700, marginBottom: 12 }}>💵 رصيد الكاش الحالي</div>
             <div style={{ fontSize: 12, color: "#9BCF9B", marginBottom: 14, lineHeight: 1.7 }}>
-              آخر سحبة من كل مصدر هي بداية المدة الحالية. أي مصروف بنفس المصدر وتاريخه بعد السحبة هيتخصم تلقائيًا من الباقي.
+              كل سحبة بتسجلها بتتزود على الرصيد، وأي مصروف بنفس المصدر من تاريخ أول سحبة مسجلة بيتخصم من الباقي تلقائيًا.
             </div>
             <div style={{ display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))" }}>
               {SOURCE_IDS.map(source => (
@@ -865,7 +872,7 @@ function CashOverview({ status, onOpen }) {
       style={{ background: "#0F1A0F", borderRadius: 14, padding: 16, marginBottom: 14, border: "1px solid #2A5A2A", cursor: "pointer" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 10 }}>
         <div>
-          <div style={{ fontSize: 13, color: "#5BEF8D", fontWeight: 800 }}>💵 كاش المدة الحالية</div>
+          <div style={{ fontSize: 13, color: "#5BEF8D", fontWeight: 800 }}>💵 رصيد الكاش الحالي</div>
           <div style={{ fontSize: 11, color: "#777", marginTop: 2 }}>اضغط لتسجيل سحبة جديدة أو مراجعة السجل</div>
         </div>
         <div style={{ color: "#5BEF8D", fontWeight: 900, fontSize: 18 }}>›</div>
@@ -873,13 +880,14 @@ function CashOverview({ status, onOpen }) {
       <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))" }}>
         {SOURCE_IDS.map(source => {
           const s = status[source];
-          const color = s?.last ? (s.remaining >= 0 ? "#5BEF8D" : "#EF5B5B") : "#777";
+          const hasCash = (s?.totalWithdrawn || 0) > 0;
+          const color = hasCash ? (s.remaining >= 0 ? "#5BEF8D" : "#EF5B5B") : "#777";
           return (
             <div key={source} style={{ background: "#111418", borderRadius: 10, padding: "10px 12px", border: "1px solid #222" }}>
-              <div style={{ fontSize: 11, color: SRC[source].color, marginBottom: 4 }}>آخر سحب {SRC[source].label}</div>
-              <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>{s?.last ? fmt(s.last.amount) : "لم يسجل بعد"}</div>
+              <div style={{ fontSize: 11, color: SRC[source].color, marginBottom: 4 }}>إجمالي مسحوب {SRC[source].label}</div>
+              <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>{hasCash ? fmt(s.totalWithdrawn) : "لم يسجل بعد"}</div>
               <div style={{ fontSize: 11, color: "#666" }}>الباقي</div>
-              <div style={{ fontWeight: 900, fontSize: 17, color }}>{s?.last ? fmt(s.remaining) : "—"}</div>
+              <div style={{ fontWeight: 900, fontSize: 17, color }}>{hasCash ? fmt(s.remaining) : "—"}</div>
             </div>
           );
         })}
@@ -889,20 +897,25 @@ function CashOverview({ status, onOpen }) {
 }
 
 function CashSourceCard({ source, status }) {
-  const last = status?.last;
-  const remainingColor = !last ? "#777" : status.remaining >= 0 ? "#5BEF8D" : "#EF5B5B";
+  const latest = status?.latest;
+  const hasCash = (status?.totalWithdrawn || 0) > 0;
+  const remainingColor = !hasCash ? "#777" : status.remaining >= 0 ? "#5BEF8D" : "#EF5B5B";
   return (
     <div style={{ background: "#111418", borderRadius: 12, padding: 14, border: `1px solid ${SRC[source].color}44` }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
         <div style={{ color: SRC[source].color, fontWeight: 800, fontSize: 14 }}>كاش {SRC[source].label}</div>
-        <div style={{ fontSize: 11, color: "#666" }}>{last ? last.date : "لا يوجد"}</div>
+        <div style={{ fontSize: 11, color: "#666" }}>{latest ? `آخر سحب: ${latest.date}` : "لا يوجد"}</div>
       </div>
       <div style={{ display: "grid", gap: 8 }}>
-        <MiniLine label="آخر سحبة" value={last ? fmt(last.amount) : "لم يتم التسجيل"} color={SRC[source].color} />
-        <MiniLine label="مصروفات المدة" value={last ? fmt(status.spent) : "—"} color="#E8E2D8" />
-        <MiniLine label={status?.remaining < 0 ? "عجز حالي" : "الباقي حاليًا"} value={last ? fmt(status.remaining) : "—"} color={remainingColor} strong />
+        <MiniLine label="إجمالي مسحوب" value={hasCash ? fmt(status.totalWithdrawn) : "لم يتم التسجيل"} color={SRC[source].color} />
+        <MiniLine label="إجمالي مصروف" value={hasCash ? fmt(status.spent) : "—"} color="#E8E2D8" />
+        <MiniLine label={status?.remaining < 0 ? "عجز حالي" : "الباقي حاليًا"} value={hasCash ? fmt(status.remaining) : "—"} color={remainingColor} strong />
       </div>
-      {last?.note && <div style={{ fontSize: 11, color: "#777", marginTop: 10, lineHeight: 1.5 }}>{last.note}</div>}
+      {latest && (
+        <div style={{ fontSize: 11, color: "#777", marginTop: 10, lineHeight: 1.5 }}>
+          آخر سحبة: {fmt(latest.amount)}{latest.note ? ` · ${latest.note}` : ""}
+        </div>
+      )}
     </div>
   );
 }
