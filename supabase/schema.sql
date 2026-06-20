@@ -3,9 +3,12 @@
 
 create table if not exists public.user_app_state (
   user_id uuid primary key references auth.users(id) on delete cascade,
-  state jsonb not null default '{"entries":{},"repayLogs":[]}'::jsonb,
+  state jsonb not null default '{"entries":{},"repayLogs":[],"cashWithdrawals":[]}'::jsonb,
   updated_at timestamptz not null default now()
 );
+
+alter table public.user_app_state
+alter column state set default '{"entries":{},"repayLogs":[],"cashWithdrawals":[]}'::jsonb;
 
 alter table public.user_app_state enable row level security;
 

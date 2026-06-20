@@ -18,23 +18,42 @@ const SRC = {
   personal:   { label: "من الشخصي",    color: "#5B8DEF", bg: "#0D1A35" },
 };
 
+const SOURCE_IDS = Object.keys(SRC);
+
 const fmt = (n) =>
   new Intl.NumberFormat("ar-EG", { style: "currency", currency: "EGP", maximumFractionDigits: 0 }).format(n || 0);
 
 function today() { return new Date().toISOString().slice(0, 10); }
 
 const KEY = "construct_v3";
-const EMPTY_STATE = { entries: {}, repayLogs: [] };
+const EMPTY_STATE = { entries: {}, repayLogs: [], cashWithdrawals: [] };
+
+const cleanAmount = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+};
 
 const normalizeState = (raw) => ({
   entries: raw?.entries && typeof raw.entries === "object" ? raw.entries : {},
   repayLogs: Array.isArray(raw?.repayLogs) ? raw.repayLogs : [],
+  cashWithdrawals: Array.isArray(raw?.cashWithdrawals)
+    ? raw.cashWithdrawals
+        .filter(w => SOURCE_IDS.includes(w?.source))
+        .map((w, idx) => ({
+          id: w.id ?? `${w.source}-${w.date || "no-date"}-${idx}`,
+          date: w.date || today(),
+          source: w.source,
+          amount: cleanAmount(w.amount),
+          note: w.note || "",
+        }))
+        .filter(w => w.amount > 0)
+    : [],
 });
 
 const hasMeaningfulData = (s) => {
   const ns = normalizeState(s);
   const entryCount = Object.values(ns.entries).reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0);
-  return entryCount > 0 || ns.repayLogs.length > 0;
+  return entryCount > 0 || ns.repayLogs.length > 0 || ns.cashWithdrawals.length > 0;
 };
 
 const load = () => {
@@ -105,7 +124,40 @@ function applyRepayment(entries, amount) {
   return { newEntries, converted: amount - remaining };
 }
 
+function sortCashWithdrawals(items) {
+  return [...items].sort((a, b) => {
+    const byDate = (b.date || "").localeCompare(a.date || "");
+    if (byDate) return byDate;
+    return String(b.id).localeCompare(String(a.id));
+  });
+}
+
+function getCashStatus(entries, cashWithdrawals) {
+  return SOURCE_IDS.reduce((acc, source) => {
+    const withdrawals = sortCashWithdrawals((cashWithdrawals || []).filter(w => w.source === source));
+    const last = withdrawals[0] || null;
+    const spent = last
+      ? CATEGORIES.reduce((sum, { id }) => (
+          sum + (entries[id] || []).reduce((entrySum, e) => {
+            if (e.source !== source) return entrySum;
+            if ((e.date || "") < last.date) return entrySum;
+            return entrySum + cleanAmount(e.amount);
+          }, 0)
+        ), 0)
+      : 0;
+
+    acc[source] = {
+      last,
+      withdrawals,
+      spent,
+      remaining: last ? cleanAmount(last.amount) - spent : 0,
+    };
+    return acc;
+  }, {});
+}
+
 const emptyForm = () => ({ subcategory: "", customSub: "", amount: "", source: "investment", note: "", date: today() });
+const emptyCashForm = () => ({ source: "investment", amount: "", note: "", date: today() });
 
 export default function App() {
   const [state, setState] = useState(load);
@@ -114,6 +166,7 @@ export default function App() {
   const [editId, setEditId]   = useState(null); // id of entry being edited
   const [repayForm, setRepayForm] = useState({ amount: "", note: "", date: today() });
   const [repayPreview, setRepayPreview] = useState(null);
+  const [cashForm, setCashForm] = useState(emptyCashForm());
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(hasSupabaseConfig);
   const [cloudLoading, setCloudLoading] = useState(false);
@@ -231,6 +284,11 @@ export default function App() {
     personal:   Object.values(totals).reduce((s, t) => s + t.personal, 0),
   }), [totals]);
 
+  const cashStatus = useMemo(
+    () => getCashStatus(state.entries, state.cashWithdrawals),
+    [state.entries, state.cashWithdrawals]
+  );
+
   // routing
   const page     = view.startsWith("cat:") ? "cat" : view.startsWith("add:") ? "add" : view;
   const curCatId = (view.startsWith("cat:") || view.startsWith("add:")) ? view.slice(4) : null;
@@ -293,9 +351,31 @@ export default function App() {
   const confirmRepay = () => {
     if (!repayPreview) return;
     const log = { id: Date.now(), date: repayForm.date, amount: repayPreview.converted, note: repayForm.note };
-    persist({ entries: repayPreview.newEntries, repayLogs: [...state.repayLogs, log] });
+    persist({ ...state, entries: repayPreview.newEntries, repayLogs: [...state.repayLogs, log] });
     setRepayForm({ amount: "", note: "", date: today() });
     setRepayPreview(null);
+  };
+
+  // ---- cash withdrawals ----
+  const saveCashWithdrawal = () => {
+    const amount = parseFloat(cashForm.amount);
+    if (!amount || isNaN(amount) || amount <= 0) return;
+
+    const withdrawal = {
+      id: Date.now(),
+      date: cashForm.date || today(),
+      source: cashForm.source,
+      amount,
+      note: cashForm.note.trim(),
+    };
+
+    persist({ ...state, cashWithdrawals: [...state.cashWithdrawals, withdrawal] });
+    setCashForm(f => ({ ...emptyCashForm(), source: f.source }));
+  };
+
+  const deleteCashWithdrawal = (id) => {
+    if (!window.confirm("متأكد إنك عايز تحذف سحبة الكاش دي؟")) return;
+    persist({ ...state, cashWithdrawals: state.cashWithdrawals.filter(w => w.id !== id) });
   };
 
   // ---- export / import ----
@@ -353,6 +433,7 @@ export default function App() {
           <div style={{ fontWeight: 700, fontSize: 17 }}>
             {view === "home"       ? "🏠 مشروع البناء" :
              view === "summary"    ? "📊 الملخص الكامل" :
+             view === "cash"       ? "💵 متابعة الكاش" :
              view === "repayments" ? "💰 تحويل الشخصي لاستثمار" :
              view === "settings"   ? "⚙️ البيانات والنسخ الاحتياطي" :
              page === "cat"        ? `${curCat?.icon} ${curCat?.name}` :
@@ -374,6 +455,8 @@ export default function App() {
               <button onClick={signOut}
                 style={{ background: "#1A1D22", color: "#EF5B5B", border: "1px solid #5B1A1A", borderRadius: 8, padding: "6px 10px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>خروج</button>
             )}
+            <button onClick={() => setView("cash")}
+              style={{ background: "#0F1A0F", color: "#5BEF8D", border: "1px solid #2A5A2A", borderRadius: 8, padding: "6px 10px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>كاش</button>
             <button onClick={() => setView("summary")}
               style={{ background: "#D4A843", color: "#111", border: "none", borderRadius: 8, padding: "6px 14px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>ملخص</button>
           </div>
@@ -394,6 +477,8 @@ export default function App() {
             </div>
             {grand.total > 0 && <SBar inv={grand.investment} total={grand.total} />}
           </div>
+
+          <CashOverview status={cashStatus} onOpen={() => setView("cash")} />
 
           {grand.personal > 0 && (
             <div onClick={() => setView("repayments")}
@@ -517,6 +602,63 @@ export default function App() {
               {editId ? "✓ حفظ التعديل" : "حفظ المصروف"}
             </button>
           </div>
+        </div>
+      )}
+
+      {/* ===== CASH WITHDRAWALS ===== */}
+      {view === "cash" && (
+        <div style={{ padding: 16 }}>
+          <div style={{ background: "#0F1A0F", borderRadius: 14, padding: 18, marginBottom: 16, border: "1px solid #2A5A2A" }}>
+            <div style={{ fontSize: 13, color: "#5BEF8D", fontWeight: 700, marginBottom: 12 }}>💵 كاش المدة الحالية</div>
+            <div style={{ fontSize: 12, color: "#9BCF9B", marginBottom: 14, lineHeight: 1.7 }}>
+              آخر سحبة من كل مصدر هي بداية المدة الحالية. أي مصروف بنفس المصدر وتاريخه بعد السحبة هيتخصم تلقائيًا من الباقي.
+            </div>
+            <div style={{ display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))" }}>
+              {SOURCE_IDS.map(source => (
+                <CashSourceCard key={source} source={source} status={cashStatus[source]} />
+              ))}
+            </div>
+          </div>
+
+          <div style={{ background: "#1A1D22", borderRadius: 14, padding: 18, marginBottom: 16, border: "1px solid #2A2D35" }}>
+            <div style={{ fontWeight: 700, marginBottom: 14, fontSize: 15 }}>تسجيل سحبة كاش جديدة</div>
+            <Field label="المصدر">
+              <div style={{ display: "flex", gap: 10 }}>
+                {SOURCE_IDS.map(src => (
+                  <button key={src} onClick={() => setCashForm(f => ({ ...f, source: src }))}
+                    style={{ flex: 1, padding: "12px 0", borderRadius: 10, border: `2px solid ${cashForm.source === src ? SRC[src].color : "#333"}`, background: cashForm.source === src ? SRC[src].bg : "transparent", color: cashForm.source === src ? SRC[src].color : "#666", fontWeight: 700, fontSize: 14, cursor: "pointer" }}>
+                    {SRC[src].label}
+                  </button>
+                ))}
+              </div>
+            </Field>
+            <Field label="تاريخ السحب">
+              <input type="date" value={cashForm.date} onChange={e => setCashForm(f => ({ ...f, date: e.target.value }))} style={iS} />
+            </Field>
+            <Field label="المبلغ المسحوب كاش (جنيه)">
+              <input type="number" inputMode="numeric" placeholder="0" value={cashForm.amount}
+                onChange={e => setCashForm(f => ({ ...f, amount: e.target.value }))}
+                style={{ ...iS, fontSize: 20, fontWeight: 700 }} />
+            </Field>
+            <Field label="ملاحظة (اختياري)">
+              <input type="text" placeholder="مثلاً: سحب من البنك أو محفظة..." value={cashForm.note}
+                onChange={e => setCashForm(f => ({ ...f, note: e.target.value }))} style={iS} />
+            </Field>
+            <button onClick={saveCashWithdrawal}
+              disabled={!cashForm.amount || cleanAmount(cashForm.amount) <= 0}
+              style={{ width: "100%", background: "#5BEF8D", color: "#111", border: "none", borderRadius: 12, padding: 14, fontWeight: 800, fontSize: 16, cursor: "pointer", opacity: (!cashForm.amount || cleanAmount(cashForm.amount) <= 0) ? 0.4 : 1 }}>
+              حفظ السحبة
+            </button>
+          </div>
+
+          {state.cashWithdrawals.length > 0 && (
+            <>
+              <div style={{ fontSize: 12, color: "#666", marginBottom: 10, fontWeight: 600 }}>سجل سحوبات الكاش</div>
+              {sortCashWithdrawals(state.cashWithdrawals).map(w => (
+                <CashWithdrawalRow key={w.id} withdrawal={w} onDelete={() => deleteCashWithdrawal(w.id)} />
+              ))}
+            </>
+          )}
         </div>
       )}
 
@@ -653,7 +795,7 @@ export default function App() {
           <div style={{ background: "#1A0D0D", borderRadius: 14, padding: 20, border: "1px solid #5B1A1A" }}>
             <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 6, color: "#EF5B5B" }}>🗑️ حذف كل البيانات</div>
             <div style={{ fontSize: 13, color: "#777", marginBottom: 14 }}>لا يمكن التراجع عن هذه العملية.</div>
-            <button onClick={() => { if (window.confirm("متأكد؟ كل البيانات هتتمسح.")) { persist({ entries: {}, repayLogs: [] }); setView("home"); } }}
+            <button onClick={() => { if (window.confirm("متأكد؟ كل البيانات هتتمسح.")) { persist({ ...EMPTY_STATE }); setView("home"); } }}
               style={{ width: "100%", background: "#EF5B5B22", color: "#EF5B5B", border: "1px solid #EF5B5B44", borderRadius: 12, padding: 14, fontWeight: 700, fontSize: 15, cursor: "pointer" }}>
               حذف كل البيانات
             </button>
@@ -713,6 +855,81 @@ function Tag({ color, label, value, big }) {
     <div style={{ flex: 1, background: color + "18", borderRadius: 8, padding: big ? "10px 12px" : "6px 10px", border: `1px solid ${color}30` }}>
       <div style={{ fontSize: big ? 11 : 10, color, marginBottom: 2 }}>{label}</div>
       <div style={{ fontWeight: 800, fontSize: big ? 16 : 13, color }}>{value}</div>
+    </div>
+  );
+}
+
+function CashOverview({ status, onOpen }) {
+  return (
+    <div onClick={onOpen}
+      style={{ background: "#0F1A0F", borderRadius: 14, padding: 16, marginBottom: 14, border: "1px solid #2A5A2A", cursor: "pointer" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 10 }}>
+        <div>
+          <div style={{ fontSize: 13, color: "#5BEF8D", fontWeight: 800 }}>💵 كاش المدة الحالية</div>
+          <div style={{ fontSize: 11, color: "#777", marginTop: 2 }}>اضغط لتسجيل سحبة جديدة أو مراجعة السجل</div>
+        </div>
+        <div style={{ color: "#5BEF8D", fontWeight: 900, fontSize: 18 }}>›</div>
+      </div>
+      <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))" }}>
+        {SOURCE_IDS.map(source => {
+          const s = status[source];
+          const color = s?.last ? (s.remaining >= 0 ? "#5BEF8D" : "#EF5B5B") : "#777";
+          return (
+            <div key={source} style={{ background: "#111418", borderRadius: 10, padding: "10px 12px", border: "1px solid #222" }}>
+              <div style={{ fontSize: 11, color: SRC[source].color, marginBottom: 4 }}>آخر سحب {SRC[source].label}</div>
+              <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>{s?.last ? fmt(s.last.amount) : "لم يسجل بعد"}</div>
+              <div style={{ fontSize: 11, color: "#666" }}>الباقي</div>
+              <div style={{ fontWeight: 900, fontSize: 17, color }}>{s?.last ? fmt(s.remaining) : "—"}</div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function CashSourceCard({ source, status }) {
+  const last = status?.last;
+  const remainingColor = !last ? "#777" : status.remaining >= 0 ? "#5BEF8D" : "#EF5B5B";
+  return (
+    <div style={{ background: "#111418", borderRadius: 12, padding: 14, border: `1px solid ${SRC[source].color}44` }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <div style={{ color: SRC[source].color, fontWeight: 800, fontSize: 14 }}>كاش {SRC[source].label}</div>
+        <div style={{ fontSize: 11, color: "#666" }}>{last ? last.date : "لا يوجد"}</div>
+      </div>
+      <div style={{ display: "grid", gap: 8 }}>
+        <MiniLine label="آخر سحبة" value={last ? fmt(last.amount) : "لم يتم التسجيل"} color={SRC[source].color} />
+        <MiniLine label="مصروفات المدة" value={last ? fmt(status.spent) : "—"} color="#E8E2D8" />
+        <MiniLine label={status?.remaining < 0 ? "عجز حالي" : "الباقي حاليًا"} value={last ? fmt(status.remaining) : "—"} color={remainingColor} strong />
+      </div>
+      {last?.note && <div style={{ fontSize: 11, color: "#777", marginTop: 10, lineHeight: 1.5 }}>{last.note}</div>}
+    </div>
+  );
+}
+
+function MiniLine({ label, value, color, strong }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 12 }}>
+      <span style={{ color: "#777" }}>{label}</span>
+      <span style={{ color, fontWeight: strong ? 900 : 700 }}>{value}</span>
+    </div>
+  );
+}
+
+function CashWithdrawalRow({ withdrawal, onDelete }) {
+  const src = SRC[withdrawal.source];
+  return (
+    <div style={{ background: "#161A1F", borderRadius: 10, padding: "12px 14px", marginBottom: 8, border: "1px solid #222", display: "flex", gap: 12, alignItems: "center" }}>
+      <div style={{ width: 4, borderRadius: 99, alignSelf: "stretch", background: src.color, flexShrink: 0 }} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontWeight: 700, fontSize: 14 }}>سحب كاش {src.label}</div>
+        <div style={{ fontSize: 11, color: "#666", marginTop: 2 }}>
+          {withdrawal.date}{withdrawal.note ? ` · ${withdrawal.note}` : ""}
+        </div>
+      </div>
+      <div style={{ fontWeight: 800, fontSize: 15, color: src.color, flexShrink: 0 }}>{fmt(withdrawal.amount)}</div>
+      <button onClick={onDelete}
+        style={{ background: "none", border: "none", color: "#444", cursor: "pointer", fontSize: 18, flexShrink: 0 }}>×</button>
     </div>
   );
 }
